@@ -25,12 +25,23 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import jwt from 'jsonwebtoken';
+import express from 'express';
+import type { Server } from 'node:http';
 
 // Import the app factory
 import { createApp } from '../../src/app.js';
 import { defaultApiRepository } from '../../src/repositories/apiRepository.js';
 import { defaultDeveloperRepository } from '../../src/repositories/developerRepository.js';
+import { apiKeyRepository } from '../../src/repositories/apiKeyRepository.js';
 import { getTokenRevocationService } from '../../src/services/tokenRevocation.js';
+import { createGatewayRouter } from '../../src/routes/gatewayRoutes.js';
+import { createApiKeyRouter } from '../../src/routes/apiKeyRoutes.js';
+import { MockSorobanBilling } from '../../src/services/billingService.js';
+import { InMemoryRateLimiter } from '../../src/services/rateLimiter.js';
+import { InMemoryUsageStore } from '../../src/services/usageStore.js';
+import { requestIdMiddleware } from '../../src/middleware/requestId.js';
+import { errorHandler } from '../../src/middleware/errorHandler.js';
+import type { ApiKey } from '../../src/types/gateway.js';
 import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -816,39 +827,135 @@ describe('API Keys Integration Tests (End-to-End with Real PostgreSQL)', () => {
 
   // ========================================================================
   // Test: Immediate Revocation Enforced at Gateway
+  //
+  // The gateway proxy handler lives in `createGatewayRouter` and is mounted at
+  // `/api/gateway` (see `src/index.ts`: `app.use("/api/gateway", ...)`), and it
+  // authenticates callers with the `x-api-key` header. `createApp()` only mounts
+  // the public health router at that prefix, so these cases mount the real
+  // router on a dedicated app — the same convention used by
+  // `tests/integration/proxy.test.ts` — and point it at an in-process upstream
+  // stub. `DELETE /api/keys/:id` is served by the real `createApiKeyRouter`, so
+  // the revocation entry really is written by the production route before the
+  // second gateway call is made.
   // ========================================================================
 
   describe('Gateway: Immediate revocation of API keys', () => {
-    it('should reject a revoked key at the gateway with 401 and never call upstream', async () => {
+    let gatewayApp: express.Express;
+    let upstreamServer: Server | undefined;
+    let upstreamUrl: string;
+    let gatewayApiKeys: Map<string, ApiKey>;
+    let billing: MockSorobanBilling;
+    let rateLimiter: InMemoryRateLimiter;
+    let usageStore: InMemoryUsageStore;
+
+    // Isolate the gateway from the configured per-user token bucket; rate
+    // limiting is covered by its own suite and is not what these cases assert.
+    const rateLimitPassthrough = (_req: any, _res: any, next: any) => next();
+
+    beforeAll(async () => {
+      // In-process upstream stub that records every proxied request.
+      await new Promise<void>((resolve) => {
+        const upstream = express();
+        upstream.use(express.json());
+        upstream.all('*', (req, res) => {
+          upstreamRequests.push({ url: req.originalUrl, method: req.method, at: Date.now() });
+          res.status(200).json({ ok: true, path: req.originalUrl });
+        });
+        upstreamServer = upstream.listen(0, '127.0.0.1', () => {
+          const addr = upstreamServer?.address();
+          if (addr && typeof addr === 'object') {
+            upstreamUrl = `http://127.0.0.1:${addr.port}`;
+          }
+          resolve();
+        });
+      });
+
+      gatewayApiKeys = new Map();
+      billing = new MockSorobanBilling({ [testUser.userId]: 1000 });
+      rateLimiter = new InMemoryRateLimiter(100, 60_000);
+      usageStore = new InMemoryUsageStore();
+
+      gatewayApp = express();
+      gatewayApp.use(express.json());
+      gatewayApp.use(requestIdMiddleware);
+
+      // Real API-key management router at its production prefix (`/api`), so
+      // `DELETE /api/keys/:id` writes the sha256 hash into the shared
+      // token-revocation singleton that the gateway handler reads.
+      gatewayApp.use(
+        '/api',
+        createApiKeyRouter({
+          apiRepository: defaultApiRepository,
+          developerRepository: defaultDeveloperRepository,
+        }),
+      );
+
+      // Real gateway proxy handler at its production mount prefix.
+      gatewayApp.use(
+        '/api/gateway',
+        createGatewayRouter({
+          billing,
+          rateLimiter,
+          usageStore,
+          upstreamUrl,
+          apiKeys: gatewayApiKeys,
+          gatewayRateLimitMiddleware: rateLimitPassthrough,
+        }),
+      );
+
+      gatewayApp.use(errorHandler);
+    }, 30000);
+
+    afterAll(async () => {
+      if (upstreamServer) {
+        await new Promise<void>((resolve) => upstreamServer!.close(() => resolve()));
+      }
+    });
+
+    beforeEach(() => {
+      gatewayApiKeys.clear();
+      upstreamRequests = [];
+      billing.setBalance(testUser.userId, 1000);
+      rateLimiter.reset();
+      usageStore.clear();
+    });
+
+    afterEach(() => {
+      apiKeyRepository.clear();
+    });
+
+    it('should reject a revoked key at the gateway with 403 and never call upstream', async () => {
       const token = signTestToken(testUser.userId, testUser.walletAddress);
 
-      // 1. Create a key via the API key router
-      const create = await request(app)
-        .post(`/apis/${testApiId}/keys`)
-        .set('Authorization', `Bearer ${token}`)
-        .send({ scopes: ['read'] });
-
-      expect(create.status).toBe(201);
-      const keyId = create.body.id;
-      const rawKey = create.body.key as string;
+      // 1. Register a key the gateway handler recognises (in-memory repository,
+      //    the same store createApiKeyRouter writes to).
+      const created = await apiKeyRepository.create({
+        apiId: 'echo',
+        userId: testUser.userId,
+        scopes: ['read'],
+        rateLimitPerMinute: null,
+      });
+      const rawKey = created.key;
+      gatewayApiKeys.set(rawKey, {
+        key: rawKey,
+        developerId: testUser.userId,
+        apiId: 'echo',
+      });
       expect(rawKey).toMatch(/^ck_live_/);
 
-      // 2. Call the gateway successfully before revocation
-      upstreamRequests = [];
-      const beforeRevocation = await request(app)
-        .get('/gateway/echo')
-        .set('Authorization', `Bearer ${rawKey}`)
-        .set('X-Upstream-Recorder', 'test');
+      // 2. Call the gateway successfully before revocation (real proxy handler).
+      const beforeRevocation = await request(gatewayApp)
+        .get('/api/gateway/echo')
+        .set('x-api-key', rawKey);
 
       // Gateway should have reached the upstream stub (2xx) before revocation
-      expect(beforeRevocation.status).toBeGreaterThanOrEqual(200);
-      expect(beforeRevocation.status).toBeLessThan(300);
+      expect(beforeRevocation.status).toBe(200);
       expect(upstreamRequests.length).toBeGreaterThan(0);
       const requestsBeforeRevocation = upstreamRequests.length;
 
-      // 3. Revoke the key via DELETE /keys/:id
-      const revoke = await request(app)
-        .delete(`/keys/${keyId}`)
+      // 3. Revoke the key via the real DELETE /api/keys/:id route
+      const revoke = await request(gatewayApp)
+        .delete(`/api/keys/${created.id}`)
         .set('Authorization', `Bearer ${token}`);
 
       expect(revoke.status).toBe(204);
@@ -864,13 +971,12 @@ describe('API Keys Integration Tests (End-to-End with Real PostgreSQL)', () => {
       expect(isRevokedByPlaintext).toBe(false);
 
       // 5. Call the gateway again with the revoked key
-      const afterRevocation = await request(app)
-        .get('/gateway/echo')
-        .set('Authorization', `Bearer ${rawKey}`)
-        .set('X-Upstream-Recorder', 'test');
+      const afterRevocation = await request(gatewayApp)
+        .get('/api/gateway/echo')
+        .set('x-api-key', rawKey);
 
-      // Must be rejected with 401
-      expect(afterRevocation.status).toBe(401);
+      // The gateway handler fails closed with 403 Forbidden for a revoked key.
+      expect(afterRevocation.status).toBe(403);
       expect(afterRevocation.body).toHaveProperty('error');
 
       // 6. Upstream stub must NOT have recorded any new request after revocation
@@ -880,39 +986,46 @@ describe('API Keys Integration Tests (End-to-End with Real PostgreSQL)', () => {
     it('should not revoke other keys when one key is deleted', async () => {
       const token = signTestToken(testUser.userId, testUser.walletAddress);
 
-      // Create two keys
-      const createA = await request(app)
-        .post(`/apis/${testApiId}/keys`)
-        .set('Authorization', `Bearer ${token}`)
-        .send({ scopes: ['read'] });
-      const createB = await request(app)
-        .post(`/apis/${testApiId}/keys`)
-        .set('Authorization', `Bearer ${token}`)
-        .send({ scopes: ['read'] });
+      // Register two keys the gateway handler recognises.
+      const createdA = await apiKeyRepository.create({
+        apiId: 'echo',
+        userId: testUser.userId,
+        scopes: ['read'],
+        rateLimitPerMinute: null,
+      });
+      const createdB = await apiKeyRepository.create({
+        apiId: 'echo',
+        userId: testUser.userId,
+        scopes: ['read'],
+        rateLimitPerMinute: null,
+      });
+      gatewayApiKeys.set(createdA.key, {
+        key: createdA.key,
+        developerId: testUser.userId,
+        apiId: 'echo',
+      });
+      gatewayApiKeys.set(createdB.key, {
+        key: createdB.key,
+        developerId: testUser.userId,
+        apiId: 'echo',
+      });
 
-      expect(createA.status).toBe(201);
-      expect(createB.status).toBe(201);
-
-      const keyA = createA.body.key as string;
-      const keyB = createB.body.key as string;
-      const keyAId = createA.body.id;
-
-      // Revoke only key A
-      const revoke = await request(app)
-        .delete(`/keys/${keyAId}`)
+      // Revoke only key A through the real route.
+      const revoke = await request(gatewayApp)
+        .delete(`/api/keys/${createdA.id}`)
         .set('Authorization', `Bearer ${token}`);
       expect(revoke.status).toBe(204);
 
-      // Key A must be rejected
-      const callA = await request(app)
-        .get('/gateway/echo')
-        .set('Authorization', `Bearer ${keyA}`);
-      expect(callA.status).toBe(401);
+      // Key A must be rejected by the gateway handler.
+      const callA = await request(gatewayApp)
+        .get('/api/gateway/echo')
+        .set('x-api-key', createdA.key);
+      expect(callA.status).toBe(403);
 
-      // Key B must still succeed
-      const callB = await request(app)
-        .get('/gateway/echo')
-        .set('Authorization', `Bearer ${keyB}`);
+      // Key B must still succeed.
+      const callB = await request(gatewayApp)
+        .get('/api/gateway/echo')
+        .set('x-api-key', createdB.key);
       expect(callB.status).toBeGreaterThanOrEqual(200);
       expect(callB.status).toBeLessThan(300);
     });
